@@ -990,7 +990,7 @@ class AdvancedFaceSearchEngine:
         return valid_matches
 
     def _store_results(self, event_id: str, results: List[Dict], update_mode: str = "full") -> int:
-        """FIXED: Store results with proper handling for zero-match guests"""
+        """FIXED: Store results with proper handling for zero-match guests and email status preservation"""
         try:
             logger.info(f"💾 FIXED: Storing {len(results)} guest results (mode: {update_mode})")
 
@@ -999,6 +999,36 @@ class AdvancedFaceSearchEngine:
 
             stored = 0
             failed = 0
+
+            # CRITICAL FIX: For incremental mode, fetch existing records to preserve email status
+            existing_email_statuses = {}
+            if update_mode == "incremental":
+                try:
+                    logger.info(f"📥 Fetching existing email statuses for incremental update")
+                    response = self.dynamodb.query(
+                        TableName="face_match_results",
+                        KeyConditionExpression="eventId = :eventId",
+                        ExpressionAttributeValues={":eventId": {"S": event_id}},
+                        ProjectionExpression="guestId, email_status, email_sent, delivery_status, whatsapp_status, whatsapp_sent, email_message_id, whatsapp_message_id, email_delivered_at, whatsapp_delivered_at, created_at"
+                    )
+                    for item in response.get("Items", []):
+                        guest_id = item.get("guestId", {}).get("S")
+                        if guest_id:
+                            existing_email_statuses[guest_id] = {
+                                "email_status": item.get("email_status", {}).get("S"),
+                                "email_sent": item.get("email_sent", {}).get("BOOL"),
+                                "delivery_status": item.get("delivery_status", {}).get("S"),
+                                "whatsapp_status": item.get("whatsapp_status", {}).get("S"),
+                                "whatsapp_sent": item.get("whatsapp_sent", {}).get("BOOL"),
+                                "email_message_id": item.get("email_message_id", {}).get("S"),
+                                "whatsapp_message_id": item.get("whatsapp_message_id", {}).get("S"),
+                                "email_delivered_at": item.get("email_delivered_at", {}).get("S"),
+                                "whatsapp_delivered_at": item.get("whatsapp_delivered_at", {}).get("S"),
+                                "created_at": item.get("created_at", {}).get("S")
+                            }
+                    logger.info(f"✅ Found existing email statuses for {len(existing_email_statuses)} guests")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to fetch existing email statuses: {e}")
 
             for i in range(0, len(results), self.config["batch_size"]):
                 batch = results[i:i + self.config["batch_size"]]
@@ -1041,13 +1071,46 @@ class AdvancedFaceSearchEngine:
                             "total_matches": {"N": str(match_count)},
                             "best_similarity": {"N": str(float(best_score))},
                             "average_similarity": {"N": str(float(average_score))},
-                            "delivery_status": {"S": "pending"},
                             "processed_at": {"S": datetime.now(timezone.utc).isoformat()},
-                            "created_at": {"S": datetime.now(timezone.utc).isoformat()},
                             "algorithm_version": {"S": "3.0-fixed"},
                             "update_mode": {"S": update_mode},
                             "new_matches": {"N": str(result["match_statistics"].get("new_matches", 0))}
                         }
+
+                        # CRITICAL FIX: Preserve email/delivery status for incremental updates
+                        guest_id = result["guest_id"]
+                        if update_mode == "incremental" and guest_id in existing_email_statuses:
+                            existing = existing_email_statuses[guest_id]
+                            logger.info(f"   📧 Preserving email status for {guest_id}: {existing.get('email_status')}/{existing.get('delivery_status')}")
+
+                            # Preserve email status fields if they exist
+                            if existing.get("email_status"):
+                                item["email_status"] = {"S": existing["email_status"]}
+                            if existing.get("email_sent") is not None:
+                                item["email_sent"] = {"BOOL": existing["email_sent"]}
+                            if existing.get("delivery_status"):
+                                item["delivery_status"] = {"S": existing["delivery_status"]}
+                            else:
+                                item["delivery_status"] = {"S": "pending"}
+                            if existing.get("whatsapp_status"):
+                                item["whatsapp_status"] = {"S": existing["whatsapp_status"]}
+                            if existing.get("whatsapp_sent") is not None:
+                                item["whatsapp_sent"] = {"BOOL": existing["whatsapp_sent"]}
+                            if existing.get("email_message_id"):
+                                item["email_message_id"] = {"S": existing["email_message_id"]}
+                            if existing.get("whatsapp_message_id"):
+                                item["whatsapp_message_id"] = {"S": existing["whatsapp_message_id"]}
+                            if existing.get("email_delivered_at"):
+                                item["email_delivered_at"] = {"S": existing["email_delivered_at"]}
+                            if existing.get("whatsapp_delivered_at"):
+                                item["whatsapp_delivered_at"] = {"S": existing["whatsapp_delivered_at"]}
+
+                            # Preserve created_at timestamp
+                            item["created_at"] = {"S": existing.get("created_at") or datetime.now(timezone.utc).isoformat()}
+                        else:
+                            # New record or full mode - set default delivery status
+                            item["delivery_status"] = {"S": "pending"}
+                            item["created_at"] = {"S": datetime.now(timezone.utc).isoformat()}
 
                         request_items.append({"PutRequest": {"Item": item}})
 
